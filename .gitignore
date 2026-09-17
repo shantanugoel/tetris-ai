@@ -1,0 +1,12 @@
+# secrets — never commit API keys
+.env
+.env.*
+!.env.example
+
+node_modules/
+npm-debug.log*
+*.log
+.DS_Store
+*.tgz
+coverage/
+.nyc_output/

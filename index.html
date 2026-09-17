@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>NEON TETRIS — playable by humans and AIs</title>
+<meta name="description" content="A canvas Tetris with SRS, T-spins, combos and back-to-back. Playable by hand, by the built-in search engine, or by any external AI over a REST API." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600;700&family=Orbitron:wght@600;800&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23070a18'/%3E%3Crect x='5' y='5' width='9' height='9' rx='2.5' fill='%23b56bff'/%3E%3Crect x='14' y='5' width='9' height='9' rx='2.5' fill='%2335e0ff'/%3E%3Crect x='14' y='14' width='9' height='9' rx='2.5' fill='%233ef08a'/%3E%3Crect x='23' y='14' width='9' height='9' rx='2.5' fill='%23ff4d6d'/%3E%3C/svg%3E" />
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+
+<div class="stage">
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark">◤</span>
+      <span class="word">NEON<i>TETRIS</i></span>
+      <span class="mark">◢</span>
+    </div>
+    <div class="chips">
+      <span class="chip" id="chip-mode">LOCAL</span>
+      <span class="chip" id="chip-seed" title="deterministic seed">seed ··</span>
+      <span class="chip ai-chip" id="chip-ai" hidden>AI&nbsp;ON</span>
+    </div>
+  </header>
+
+  <main class="play">
+    <!-- -------------------------------------------------- left column -->
+    <aside class="col left">
+      <section class="panel">
+        <h2 class="label">Hold <span class="dimkey">C</span></h2>
+        <div class="mini hold"><canvas id="holdCanvas"></canvas></div>
+      </section>
+
+      <section class="panel stats">
+        <div class="stat score">
+          <span class="label">Score</span>
+          <strong id="score">0</strong>
+        </div>
+        <div class="stat"><span class="label">Lines</span><b id="lines">0</b></div>
+        <div class="stat"><span class="label">Level</span><b id="level">1</b></div>
+        <div class="stat"><span class="label">Pieces</span><b id="pieces">0</b></div>
+        <div class="stat"><span class="label">Combo</span><b id="combo">—</b></div>
+        <div class="stat"><span class="label">Back&nbsp;to&nbsp;back</span><b id="b2b">—</b></div>
+        <div class="stat"><span class="label">PPM</span><b id="ppm">0.0</b></div>
+        <div class="stat"><span class="label">APM</span><b id="apm">0.0</b></div>
+      </section>
+
+      <section class="panel records">
+        <div class="stat"><span class="label">Best score</span><b id="best">0</b></div>
+        <div class="stat"><span class="label">Tetrises</span><b id="tetrises">0</b></div>
+        <div class="stat"><span class="label">T-spins</span><b id="tspins">0</b></div>
+      </section>
+    </aside>
+
+    <!-- ------------------------------------------------------- well -->
+    <section class="well-wrap">
+      <canvas id="board"></canvas>
+      <div class="overlay" id="overlay">
+        <div class="card">
+          <h1 class="title" id="ov-title">NEON <i>TETRIS</i></h1>
+          <p class="subtitle" id="ov-sub">10 × 20 · SRS wall kicks · T-spins · combos · back-to-back</p>
+          <div class="ov-stats" id="ov-stats" hidden></div>
+          <div class="ov-actions">
+            <button class="btn primary" id="ov-primary" autofocus>Start game</button>
+            <button class="btn" id="ov-secondary">Let the AI play</button>
+          </div>
+          <p class="ov-hint" id="ov-hint">or press <kbd>Enter</kbd></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------- right column -->
+    <aside class="col right">
+      <section class="panel">
+        <h2 class="label">Next <span class="dimkey">queue</span></h2>
+        <div class="next" id="nextQueue">
+          <div class="mini q0"><canvas></canvas></div>
+          <div class="mini q1"><canvas></canvas></div>
+          <div class="mini q2"><canvas></canvas></div>
+          <div class="mini q3"><canvas></canvas></div>
+          <div class="mini q4"><canvas></canvas></div>
+        </div>
+      </section>
+
+      <section class="panel ai-panel">
+        <h2 class="label">Engine <span class="dimkey">AI</span></h2>
+        <div class="seg" id="difficulty" role="radiogroup" aria-label="AI difficulty">
+          <button data-diff="easy">Easy</button>
+          <button data-diff="normal">Normal</button>
+          <button data-diff="hard" class="on">Hard</button>
+          <button data-diff="insane">Insane</button>
+        </div>
+        <div class="decision" id="decision">idle</div>
+        <div class="feed" id="feed" aria-live="polite"></div>
+      </section>
+
+      <section class="panel api">
+        <h2 class="label">API <span class="dimkey">play me over http</span></h2>
+        <pre id="apiSnippet">POST /api/games
+GET  /api/games/&lt;id&gt;
+POST /api/games/&lt;id&gt;/actions</pre>
+        <button class="btn tiny" id="copyApi">Copy curl</button>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="bottom">
+    <div class="keys">
+      <span><kbd>←</kbd><kbd>→</kbd> move</span>
+      <span><kbd>↑</kbd>/<kbd>x</kbd> rotate</span>
+      <span><kbd>z</kbd> ccw</span>
+      <span><kbd>↓</kbd> soft</span>
+      <span><kbd>space</kbd> hard</span>
+      <span><kbd>c</kbd> hold</span>
+      <span><kbd>a</kbd> engine</span>
+      <span><kbd>t</kbd> turbo</span>
+      <span><kbd>m</kbd> sound</span>
+      <span><kbd>p</kbd> pause</span>
+      <span><kbd>r</kbd> restart</span>
+    </div>
+    <div class="toolbar">
+      <button class="btn" id="btn-ai">Engine <b>off</b></button>
+      <button class="btn" id="btn-turbo">Turbo <b>off</b></button>
+      <button class="btn" id="btn-sound">Sound <b>off</b></button>
+      <button class="btn" id="btn-pause">Pause</button>
+      <button class="btn" id="btn-restart">Restart</button>
+      <button class="btn" id="btn-remote">Watch API game</button>
+    </div>
+  </footer>
+</div>
+
+<div class="touch" id="touch">
+  <button data-act="left">◀</button>
+  <button data-act="rotate_ccw">↺</button>
+  <button data-act="rotate_cw">↻</button>
+  <button data-act="soft_drop">▼</button>
+  <button data-act="right">▶</button>
+  <button data-act="hard_drop">⤓</button>
+  <button data-act="hold">⇄</button>
+</div>
+
+<script type="module" src="src/app.js"></script>
+</body>
+</html>

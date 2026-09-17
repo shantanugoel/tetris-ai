@@ -1,0 +1,30 @@
+{
+  "name": "neon-tetris",
+  "version": "1.0.0",
+  "description": "A beautiful browser Tetris with a first-class AI API (REST + in-page JS), a built-in search engine, and drop-in agents for Jev / any chat API.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test/headless.test.js && node test/ai.test.js && node test/api.test.js && node test/agents.test.js",
+    "play": "node tools/api-play.js",
+    "jev": "node tools/jev-play.js",
+    "llm": "node tools/llm-play.js",
+    "bench": "node tools/bench.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "tetris",
+    "ai",
+    "jev",
+    "typesafe",
+    "llm",
+    "agent",
+    "benchmark",
+    "srs"
+  ],
+  "license": "MIT"
+}
