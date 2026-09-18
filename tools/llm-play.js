@@ -12,22 +12,33 @@
  * all answer to. Point OPENAI_BASE_URL at the one you want.
  *
  * A chat model is a text generator, so everything around it is defensive:
- * the reply is scanned for JSON rather than trusted, every action is checked
- * against `legalActions`, a reply that fails to lock the piece is replaced by
- * the built-in engine's move, and the game never depends on the model being
- * well-behaved. `tools/jev-play.js` is the contrasting design: a decision
- * model that cannot return an invalid value in the first place.
+ * the reply is scanned for JSON rather than trusted, action names are mapped
+ * from the model's vocabulary onto ours ("rotate", "drop", "a"...), every
+ * action is checked against `legalActions`, a reply that fails to lock the
+ * piece is replaced by the built-in engine's move, and the game never depends
+ * on the model being well-behaved. `tools/jev-play.js` is the contrasting
+ * design: a decision model that cannot return an invalid value in the first
+ * place.
  *
  * Flags:
  *   --seed s --level n --pieces N --url http://host:port
  *   --base-url https://api.openai.com/v1 --model gpt-4o-mini --api-key sk-...
  *   --temperature 0.2 --max-tokens 300 --no-json (skip response_format)
  *   --usd-per-mtok-in 0.15 --usd-per-mtok-out 0.6   (for the cost line)
- *   --delay ms --quiet --dry-run --no-engine-fallback
+ *   --delay ms --quiet --debug --dry-run --no-engine-fallback
+ *   Unknown flags are a hard error. `--min-confidence` and `--danger-confidence`
+ *   are jev-play's knobs: this agent has no confidence gate to loosen.
+ *
+ * Engine fallback here happens in exactly three situations — the log says which:
+ *   [provider error]          the call failed even after the retry
+ *   [unusable reply ...]      every token was illegal or unrecognised (shows them)
+ *   [reply did not lock ...]  the piece survived the turn, so the engine finishes it
+ * Mostly-engine games are nearly always a vocabulary or format problem, and
+ * `--debug` prints the raw reply to show you which.
  */
 
 import { pathToFileURL } from 'node:url';
-import { loadEnv } from './env.js';
+import { loadEnv, parseArgs } from './env.js';
 import { ApiClient } from './api-play.js';
 
 loadEnv();
@@ -103,6 +114,52 @@ export function extractJson(text) {
 const KNOWN = ['left', 'right', 'rotate_cw', 'rotate_ccw', 'rotate_180', 'soft_drop', 'hard_drop', 'hold'];
 
 /**
+ * Chat models invent action names constantly — "rotate", "drop", "move_left",
+ * "a", "slam". Map the common coinages onto the real vocabulary BEFORE the
+ * legality check, so a model that means `rotate_cw` but writes `rotate` is not
+ * silently discarded. Aliasing cannot make an illegal move legal: an alias only
+ * ever resolves to a canonical action, which then still has to be in
+ * `legalActions` for this exact state.
+ */
+const ACTION_ALIASES = {
+  a: 'left', l: 'left', move_left: 'left', go_left: 'left', slide_left: 'left',
+  d: 'right', r: 'right', move_right: 'right', go_right: 'right', slide_right: 'right',
+  rotate: 'rotate_cw', rot: 'rotate_cw', cw: 'rotate_cw', spin: 'rotate_cw',
+  rotate_clockwise: 'rotate_cw', rotation_cw: 'rotate_cw', turn: 'rotate_cw',
+  ccw: 'rotate_ccw', rot_ccw: 'rotate_ccw', rotate_acw: 'rotate_ccw',
+  rotate_counter_clockwise: 'rotate_ccw', rotate_counterclockwise: 'rotate_ccw', anticlockwise: 'rotate_ccw',
+  flip: 'rotate_180', rot180: 'rotate_180', turnaround: 'rotate_180', spin180: 'rotate_180',
+  down: 'soft_drop', softdrop: 'soft_drop', drop_down: 'soft_drop', lower: 'soft_drop',
+  drop: 'hard_drop', slam: 'hard_drop', harddrop: 'hard_drop', drop_piece: 'hard_drop',
+  place: 'hard_drop', lock: 'hard_drop', full_drop: 'hard_drop', instant_drop: 'hard_drop',
+  swap: 'hold', hold_piece: 'hold', take_hold: 'hold', use_hold: 'hold', swap_hold: 'hold',
+};
+
+/** canonical action name, or null if we have no idea what the model meant. */
+const ALIAS_INDEX = Object.fromEntries(
+  [...KNOWN.map((k) => [k, k]), ...Object.entries(ACTION_ALIASES)].map(([k, v]) => [k.replace(/_/g, ''), v]),
+);
+export function normalizeAction(token) {
+  const raw = String(token).trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (!raw) return null;
+  if (KNOWN.includes(raw)) return raw;
+  return ALIAS_INDEX[raw.replace(/_/g, '')] ?? null;
+}
+
+/**
+ * Did this response actually finish the piece?
+ *
+ * `stats.pieces` counts SPAWNS, not locks. A reply that locks a piece always
+ * spawns the next one — unless the lock itself ended the game: "lockout" fires
+ * inside lock(), *before* the spawn, so pieces does not move. Reading that as
+ * "the model failed to lock" sends a /hint request to a dead game, and the 409
+ * that comes back kills the whole run and eats the summary. Hence `over` first.
+ */
+export function didLock(res, state) {
+  return Boolean(res) && (res.over === true || res.pieces !== state.pieces);
+}
+
+/**
  * Model output -> a safe action list. Unknown tokens are dropped, `hold` only
  * when legal, the list is capped, and a missing hard_drop is added so the
  * piece always locks (a piece that never locks would stall the loop forever).
@@ -110,21 +167,23 @@ const KNOWN = ['left', 'right', 'rotate_cw', 'rotate_ccw', 'rotate_180', 'soft_d
  * Deliberately NOT rescued: a reply with nothing usable in it comes back empty,
  * so the caller can tell "the model chose this" apart from "our code dropped a
  * hard_drop in", and hand the piece to the engine instead of taking credit.
+ * `dropped` is returned so the log can say *why* a reply was unusable.
  */
 export function sanitizeReply(parsed, state) {
   const legal = new Set(state.legalActions);
   const raw = Array.isArray(parsed?.actions) ? parsed.actions : [];
   const actions = [];
+  const dropped = [];
   for (const token of raw) {
-    const a = String(token).trim().toLowerCase().replace(/[^a-z_]/g, '');
-    if (!KNOWN.includes(a) || !legal.has(a)) continue;
+    const a = normalizeAction(token);
+    if (!a || !legal.has(a)) { dropped.push(String(token)); continue; }
     actions.push(a);
     if (actions.length >= 64) break;
   }
   const reason = typeof parsed?.reason === 'string' ? parsed.reason : '';
-  if (!actions.length) return { actions: [], reason };
+  if (!actions.length) return { actions: [], reason, dropped };
   if (!actions.includes('hard_drop') && legal.has('hard_drop')) actions.push('hard_drop');
-  return { actions: actions.slice(0, 65), reason };
+  return { actions: actions.slice(0, 65), reason, dropped };
 }
 
 /** Last-resort string scrape for models that ignore the JSON shape entirely. */
@@ -193,7 +252,7 @@ export async function playGame(opts = {}) {
   log(`game ${id} — watch live: ${o.url ?? 'http://127.0.0.1:8787'}/?game=${id}`);
 
   const tally = {
-    game: id, seed: created.seed, pieces: 0, fromModel: 0, fromEngine: 0, badReplies: 0,
+    game: id, seed: created.seed, pieces: 0, fromModel: 0, fromEngine: 0, badReplies: 0, notLocked: 0,
     calls: 0, promptTokens: 0, completionTokens: 0, model: o.model, latencyMs: 0,
     providerErrors: 0, consecutiveErrors: 0,
     lines: 0, score: 0, level: 1, stats: {}, over: false, overReason: null,
@@ -231,7 +290,7 @@ export async function playGame(opts = {}) {
       tally.completionTokens += reply.usage?.completion_tokens ?? 0;
     }
 
-    let move = { actions: [], reason: '' };
+    let move = { actions: [], reason: '', dropped: [] };
     if (reply) {
       const parsed = extractJson(reply.text) ?? { actions: scrapeActions(reply.text), reason: '(scraped)' };
       move = sanitizeReply(parsed, state);
@@ -254,16 +313,22 @@ export async function playGame(opts = {}) {
     }
 
     let source = 'model';
+    let why = null;
     let res = move.actions.length ? await api.actions(id, move.actions, cursor) : null;
-    // If the model's reply did not lock the piece, do not let it stall the game.
-    if (!res || res.pieces === state.pieces) {
+    // A reply that left the piece unlocked would stall the game forever, so the
+    // engine takes it — but a game that just ended is not a failed reply.
+    if (!didLock(res, state)) {
       source = 'engine';
-      if (move.actions.length) tally.badReplies++;
+      why = !reply ? 'provider error'
+        : !move.actions.length ? `unusable reply (${move.dropped.length ? `dropped ${JSON.stringify(move.dropped)}` : 'no actions'})`
+          : 'reply did not lock the piece';
+      if (why === 'reply did not lock the piece') tally.notLocked++;
       if (!o.engineFallback) {
         res = await api.actions(id, ['hard_drop'], cursor);
       } else {
-        const h = await api.hint(id, o.difficulty);
-        res = await api.actions(id, h.actions, cursor);
+        // Belt and braces: never ask a finished game for advice.
+        const h = await api.hint(id, o.difficulty).catch(() => null);
+        res = await api.actions(id, h?.actions?.length ? h.actions : ['hard_drop'], cursor);
       }
     }
     cursor = res.eventCursor;
@@ -274,7 +339,9 @@ export async function playGame(opts = {}) {
 
     log(`  ${String(res.pieces).padStart(4)} ${state.active.name} → ${source === 'model' ? move.actions.join(' ') : 'engine fallback'}`
       + `${move.reason && source === 'model' ? `  "${move.reason.slice(0, 60)}"` : ''}`
+      + (why ? `  [${why}]` : '')
       + `  ${reply ? `${latency}ms` : 'no call'}${res.rejected?.length ? `  REJECTED ${JSON.stringify(res.rejected)}` : ''}`);
+    if (o.debug && reply) log(`      raw: ${String(reply.text).replace(/\s+/g, ' ').slice(0, 200)}`);
 
     if (res.over) { Object.assign(tally, { over: true, overReason: res.overReason }); break; }
     if (o.delay) await new Promise((r) => setTimeout(r, o.delay));
@@ -289,27 +356,33 @@ export async function playGame(opts = {}) {
 
 export function formatTally(t) {
   const pct = t.pieces ? (100 * t.fromModel / t.pieces).toFixed(0) : '0';
-  return [
+  const lines = [
     ``,
     `  ${t.over ? `game over (${t.overReason})` : 'still running'} after ${t.pieces} pieces`,
     `  score ${t.score}   lines ${t.lines}   level ${t.level}   tetrises ${t.stats.tetrises ?? 0}   t-spins ${t.stats.tspins ?? 0}`,
-    `  decisions: ${t.fromModel} model (${pct}%)   ${t.fromEngine} engine fallback   ${t.badReplies} unusable replies`,
+    `  decisions: ${t.fromModel} model (${pct}%)   ${t.fromEngine} engine fallback   ${t.badReplies} unusable replies${t.notLocked ? `   ${t.notLocked} did not lock` : ''}`,
     `  ${t.calls} calls on ${t.model ?? '—'}   ${t.avgLatencyMs.toFixed(0)}ms avg   ${t.promptTokens} in / ${t.completionTokens} out tokens${t.costUsd ? `   ~$${t.costUsd.toFixed(5)}` : ''}${t.providerErrors ? `   ${t.providerErrors} provider errors` : ''}`,
     `  watch live: ${t.watchUrl ?? ''}`,
-  ].join('\n');
+  ];
+  if (t.pieces && t.fromEngine / t.pieces > 0.5) {
+    lines.push(`  most pieces went to the engine. Rerun with --debug: the usual cause is an`);
+    lines.push(`  action vocabulary or reply format the parser cannot read, not a weak model.`);
+  }
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------- cli
 
 export async function main(argv = process.argv.slice(2)) {
-  const flags = {}; const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++; } else flags[key] = true;
-    } else rest.push(argv[i]);
-  }
+  const { flags, rest } = parseArgs(argv, {
+    values: ['url', 'seed', 'pieces', 'level', 'model', 'base-url', 'api-key', 'temperature',
+      'max-tokens', 'difficulty', 'delay', 'usd-per-mtok-in', 'usd-per-mtok-out'],
+    booleans: ['quiet', 'dry-run', 'json', 'no-json', 'no-engine-fallback', 'debug'],
+    near: {
+      'min-confidence': 'jev-play', 'danger-confidence': 'jev-play',
+      'danger-at': 'jev-play', 'hold-threshold': 'jev-play',
+    },
+  });
   const num = (v, d) => (v === undefined ? d : Number(v));
   const opts = {
     seed: flags.seed ?? rest[0],
@@ -327,6 +400,7 @@ export async function main(argv = process.argv.slice(2)) {
     delay: num(flags.delay, 0),
     quiet: Boolean(flags.quiet),
     dryRun: Boolean(flags['dry-run']),
+    debug: Boolean(flags.debug),
     jsonMode: flags.json !== true && flags['no-json'] !== true,
     engineFallback: flags['no-engine-fallback'] !== true,
   };

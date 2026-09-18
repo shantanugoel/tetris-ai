@@ -35,3 +35,64 @@ export function loadEnv(filename = '.env') {
   }
   return loaded;
 }
+
+/**
+ * Small argv parser shared by the CLI tools: `--flag value`, `--key=value`,
+ * `--boolean-flag`, positionals. `spec` = { values: [...], booleans: [...], near: {} }.
+ *
+ * An unknown flag is an error, not a shrug. Silently ignoring `--min-confidence 0`
+ * on a tool that has no confidence gate is the most expensive kind of typo in a
+ * benchmark harness: it looks like it worked and quietly changes what you measured.
+ */
+export function parseArgs(argv, spec = {}) {
+  const values = new Set(spec.values ?? []);
+  const booleans = new Set(spec.booleans ?? []);
+  const near = spec.near ?? {};
+  const flags = {};
+  const rest = [];
+  const unknown = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const tok = argv[i];
+    if (!tok.startsWith('--')) { rest.push(tok); continue; }
+    const eq = tok.indexOf('=');
+    const key = eq > 1 ? tok.slice(2, eq) : tok.slice(2);
+    if (!values.has(key) && !booleans.has(key)) { unknown.push(tok); continue; }
+    if (booleans.has(key)) {
+      flags[key] = eq > 1 ? !['0', 'false', 'no', ''].includes(tok.slice(eq + 1).toLowerCase()) : true;
+      continue;
+    }
+    const val = eq > 1 ? tok.slice(eq + 1) : argv[++i];
+    if (val === undefined || val.startsWith('--')) throw new Error(`--${key} needs a value`);
+    flags[key] = val;
+  }
+
+  if (unknown.length) {
+    const known = [...values, ...booleans].sort();
+    const lines = [`unknown flag ${unknown.join(', ')}`];
+    for (const u of unknown) {
+      const bare = u.replace(/^--/, '').split('=')[0];
+      if (near[bare]) lines.push(`  --${bare} belongs to tools/${near[bare]}.js — this tool has no such gate`);
+      else {
+        const close = known.map((k) => [k, distance(bare, k)]).filter(([, d]) => d <= 3).sort((a, b) => a[1] - b[1])[0];
+        if (close) lines.push(`  did you mean --${close[0]}?`);
+      }
+    }
+    lines.push(`  accepted: ${known.map((k) => `--${k}`).join(' ')}`);
+    throw new Error(lines.join('\n'));
+  }
+  return { flags, rest };
+}
+
+function distance(a, b) {
+  const m = [...a]; const n = [...b];
+  let prev = Array.from({ length: n.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= m.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (m[i - 1] === n[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n.length];
+}

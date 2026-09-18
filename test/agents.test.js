@@ -12,11 +12,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import { ApiClient } from '../tools/api-play.js';
 import {
-  visibleRows, stackStats, describeOption, orderCandidates, buildRequest, decide, askJev, playGame as jevGame,
+  visibleRows, stackStats, describeOption, orderCandidates, buildRequest, decide, askJev, playGame as jevGame, main as jevMain,
 } from '../tools/jev-play.js';
 import {
-  extractJson, sanitizeReply, scrapeActions, buildUserMessage, playGame as llmGame,
+  extractJson, sanitizeReply, scrapeActions, buildUserMessage, normalizeAction, didLock,
+  playGame as llmGame, main as llmMain,
 } from '../tools/llm-play.js';
+import { parseArgs } from '../tools/env.js';
 
 const PORT = 8841 + Math.floor(Math.random() * 60);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -220,6 +222,64 @@ const fakeCands = [
   ok('garbage becomes an empty list', sanitizeReply({}, live).actions.length === 0);
   ok('runaway lists are capped', sanitizeReply({ actions: Array.from({ length: 400 }, () => 'left') }, live).actions.length <= 65);
   ok('user message tells the model what it must obey', /legalActions/.test(buildUserMessage({ ...live, ascii: 'x', active: null, queue: [], score: 0, lines: 0, level: 1, combo: 0, backToBack: 0 })));
+}
+
+{
+  // Models rarely use our exact verbs, and dropping them for it is the number
+  // one cause of "why is everything engine fallback". Aliasing runs before the
+  // legality check, so it can never smuggle in a move that is not legal now.
+  ok('"rotate" means rotate_cw', normalizeAction('rotate') === 'rotate_cw' && normalizeAction('ROTATE_CW') === 'rotate_cw');
+  ok('"drop"/"slam"/"a" map onto real actions', normalizeAction('drop') === 'hard_drop' && normalizeAction('slam') === 'hard_drop' && normalizeAction('a') === 'left');
+  ok('hyphens, spaces and punctuation survive', normalizeAction('hard-drop') === 'hard_drop' && normalizeAction('Move left!') === 'left' && normalizeAction('rotate cw') === 'rotate_cw');
+  ok('nonsense stays nonsense', normalizeAction('dance') === null && normalizeAction('up') === null && normalizeAction('') === null);
+
+  const noHold = { legalActions: ['left', 'rotate_cw', 'hard_drop'], canHold: false };
+  ok('an alias is still refused when the move is illegal', sanitizeReply({ actions: ['swap', 'drop'] }, noHold).actions.join() === 'hard_drop');
+  ok('unusable replies report what was dropped', sanitizeReply({ actions: ['wiggle', 'vibe'] }, noHold).dropped.join() === 'wiggle,vibe');
+
+  // stats.pieces counts SPAWNS, and "lockout" ends the game inside lock(),
+  // before the next spawn — so pieces does not move. Reading that as "the model
+  // failed to lock" used to ask a dead game for a hint, and the 409 killed the
+  // run before it could print a summary.
+  ok('a lockout is a finished game, not a failed reply', didLock({ over: true, pieces: 12 }, { pieces: 12 }) === true);
+  ok('a reply that left the piece in play is a failed reply', didLock({ over: false, pieces: 12 }, { pieces: 12 }) === false);
+  ok('a reply that queued the next piece counts', didLock({ over: false, pieces: 13 }, { pieces: 12 }) === true);
+}
+
+{
+  // A competent model still ends games eventually; that must be a result, not
+  // a crash (and not an engine fallback credited to the reply that ended it).
+  const stacker = async (messages) => {
+    const st = JSON.parse(messages[1].content);
+    const dir = st.legalActions.includes('left') ? 'left' : 'right';
+    return { text: `{"actions":["${dir}","hard_drop"],"reason":"stack it up"}`, usage: {} };
+  };
+  let tally = null; let threw = null;
+  try { tally = await llmGame({ api: new ApiClient(BASE), chat: stacker, seed: 'llm-lockout', pieces: 200, log: () => {} }); } catch (e) { threw = e; }
+  ok('a game the model ends is reported, not thrown', !threw, threw?.message);
+  ok('the model keeps credit right up to the end', Boolean(tally) && tally.over && tally.fromModel === tally.pieces && tally.notLocked === 0 && tally.fromEngine === 0,
+    JSON.stringify({ p: tally?.pieces, m: tally?.fromModel, e: tally?.fromEngine, nl: tally?.notLocked, why: tally?.overReason }));
+}
+
+{
+  const spec = { values: ['seed', 'pieces'], booleans: ['quiet'] };
+  ok('flags parse', parseArgs(['--seed', 'x', '--pieces', '5', 'extra'], spec).flags.seed === 'x' && parseArgs(['--seed', 'x'], spec).rest.length === 0);
+  const b = parseArgs(['--quiet', 'demo'], spec);
+  ok('a boolean flag does not swallow the positional', b.flags.quiet === true && b.rest.join() === 'demo');
+  ok('--key=value and --flag=0 work', parseArgs(['--pieces=7'], spec).flags.pieces === '7' && parseArgs(['--quiet=0'], spec).flags.quiet === false);
+  let msg = '';
+  try { await llmMain(['--min-confidence', '0']); } catch (e) { msg = e.message; }
+  ok('llm-play refuses a flag it does not implement', /unknown flag --min-confidence/.test(msg), JSON.stringify(msg));
+  ok('and names the tool that does implement it', /belongs to tools\/jev-play\.js/.test(msg), JSON.stringify(msg));
+  msg = '';
+  try { await jevMain(['--base-url', 'http://x']); } catch (e) { msg = e.message; }
+  ok('jev-play refuses llm-play\'s knobs', /belongs to tools\/llm-play\.js/.test(msg), JSON.stringify(msg));
+  msg = '';
+  try { await jevMain(['--peices', '10']); } catch (e) { msg = e.message; }
+  ok('a typo gets the closest real flag suggested', /did you mean --pieces\?/.test(msg), JSON.stringify(msg));
+  msg = '';
+  try { await llmMain(['--pieces']); } catch (e) { msg = e.message; }
+  ok('a flag with no value is an error', /--pieces needs a value/.test(msg), JSON.stringify(msg));
 }
 
 {

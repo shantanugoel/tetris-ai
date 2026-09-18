@@ -29,7 +29,7 @@
  */
 
 import { pathToFileURL } from 'node:url';
-import { loadEnv } from './env.js';
+import { loadEnv, parseArgs } from './env.js';
 import { ApiClient } from './api-play.js';
 
 loadEnv();
@@ -420,14 +420,16 @@ export function formatTally(t) {
 // ---------------------------------------------------------------------- cli
 
 export async function main(argv = process.argv.slice(2)) {
-  const flags = {}; const rest = [];
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i].startsWith('--')) {
-      const key = argv[i].slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) { flags[key] = next; i++; } else flags[key] = true;
-    } else rest.push(argv[i]);
-  }
+  const { flags, rest } = parseArgs(argv, {
+    values: ['url', 'seed', 'pieces', 'level', 'model', 'delay', 'until', 'difficulty',
+      'min-confidence', 'danger-confidence', 'danger-at', 'hold-threshold'],
+    booleans: ['quiet', 'dry-run', 'no-engine-fallback'],
+    near: {
+      'base-url': 'llm-play', 'api-key': 'llm-play', 'temperature': 'llm-play',
+      'max-tokens': 'llm-play', 'no-json': 'llm-play', 'debug': 'llm-play',
+      'usd-per-mtok-in': 'llm-play', 'usd-per-mtok-out': 'llm-play',
+    },
+  });
   const num = (v, d) => (v === undefined ? d : Number(v));
   const opts = {
     seed: flags.seed ?? rest[0],

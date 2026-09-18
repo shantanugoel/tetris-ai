@@ -167,11 +167,39 @@ OPENAI_BASE_URL=https://openrouter.ai/api/v1 OPENAI_MODEL=anthropic/claude-... n
 
 The model gets the board as ASCII plus its legal action vocabulary and replies with
 `{"actions":[...],"reason":"..."}`. Everything around it is defensive, because chat
-models are text generators: JSON is recovered out of fenced prose, every action is
-checked against `legalActions`, `hold` is refused when unavailable, a missing
-`hard_drop` is appended so the piece always locks, one invalid reply earns exactly one
-correction round-trip, and a reply that still doesn't lock the piece is replaced by the
-engine's move. A hopeless model never stalls a game.
+models are text generators: JSON is recovered out of fenced prose, action names are
+translated from whatever the model actually wrote, every action is checked against
+`legalActions`, `hold` is refused when unavailable, a missing `hard_drop` is appended so
+the piece always locks, one invalid reply earns exactly one correction round-trip, and a
+reply that still doesn't lock the piece is replaced by the engine's move. A hopeless
+model never stalls a game.
+
+| the model writes | |
+|---|---|
+| `rotate`, `cw`, `spin`, `turn` | `rotate_cw` (also `_ccw`, `flip`/`rot180` → `rotate_180`) |
+| `drop`, `slam`, `lock`, `place` | `hard_drop` — `down`, `lower` → `soft_drop` |
+| `a`, `move_left`, `go-right` | `left` / `right` (case, hyphens and punctuation ignored) |
+| `swap`, `take_hold` | `hold` |
+
+Aliases resolve to canonical actions, which then still have to be legal in that exact
+state — a translation can never invent an illegal move. Anything unrecognised is dropped
+and reported.
+
+**When llm-play uses the engine instead of the model** — and only these three, each
+labelled in the log:
+
+| log line | meaning |
+|---|---|
+| `[provider error]` | the call failed even after the retry |
+| `[unusable reply (dropped [...])]` | every token was illegal or unrecognised |
+| `[reply did not lock the piece]` | the piece survived the turn, so the engine finishes it |
+
+There is no confidence gate here to turn off: `--min-confidence` and
+`--danger-confidence` belong to `jev-play.js`, and both tools now **reject unknown flags**
+and name the tool that owns them, because a silently ignored knob in a benchmark harness
+changes what you measured without telling you. If most pieces go to the engine, rerun
+with `--debug` — it prints the raw reply, and the cause is almost always vocabulary or
+format rather than the model being bad at Tetris.
 
 ## Benchmarking
 
